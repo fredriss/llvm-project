@@ -1,0 +1,27 @@
+RUN: rm -rf %t
+RUN: mkdir -p %t
+
+RUN: not clang-stat-cache %t/not-there -o %t/stat.cache 2>&1 | FileCheck --check-prefix=NO-SUCH-DIR %s
+NO-SUCH-DIR: Failed to stat the target directory: No such file or directory
+
+RUN: mkdir -p %t/dir
+RUN: mkdir -p %t/dir2
+
+# Try to overwrite a few invalid caches
+RUN: echo "Not a stat cache" > %t/stat.cache
+RUN: not clang-stat-cache %t/dir -o %t/stat.cache 2>&1 | FileCheck --check-prefix=INVALID-CACHE %s
+RUN: echo "Not a stat cache, but bigger than the stat cache header" > %t/stat.cache
+RUN: not clang-stat-cache %t/dir -o %t/stat.cache 2>&1 | FileCheck --check-prefix=INVALID-CACHE %s
+RUN: echo "STAT. This has the correct MAGIC and is bigger than the header." > %t/stat.cache
+RUN: not clang-stat-cache %t/dir -o %t/stat.cache 2>&1 | FileCheck --check-prefix=INVALID-CACHE %s
+
+INVALID-CACHE: The output cache file is not empty or a valid cache. Giving up.
+
+# Generate a valid cache for dir
+RUN: rm %t/stat.cache
+RUN: clang-stat-cache %t/dir -o %t/stat.cache
+RUN: cp %t/stat.cache %t/stat.cache.save
+
+# Rewrite the cache with a different base directory
+RUN: clang-stat-cache %t/dir2 -o %t/stat.cache 2>&1 | FileCheck --check-prefix=OTHER-DIR %s
+OTHER-DIR: Exisitng cache has different directory. Regenerating...

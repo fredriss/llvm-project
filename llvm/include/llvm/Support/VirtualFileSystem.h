@@ -40,6 +40,7 @@
 
 namespace llvm {
 
+template <typename T> class OnDiskIterableChainedHashTable;
 class MemoryBuffer;
 class MemoryBufferRef;
 class Twine;
@@ -1104,6 +1105,40 @@ public:
   const std::vector<YAMLVFSEntry> &getMappings() const { return Mappings; }
 
   void write(llvm::raw_ostream &OS);
+};
+
+/// A ProxyFileSystem using cached information for status() rather than going to
+/// the real filesystem.
+///
+/// When dealing with a huge tree of (mostly) immutable filesystem content
+/// like and SDK, it can be very costly to ask the underlying filesystem for
+/// `stat` data. Even when caching the `stat`s internally, having many
+/// concurrent Clangs accessing the same tree in a similar way causes
+/// contention. As SDK files are mostly immutable, we can pre-compute the status
+/// information using clang-stat-cache and use that information directly without
+/// accessing the real filesystem until Clang needs to open a file. This can
+/// speed up module verification and HeaderSearch by significant amounts.
+class StatCacheFileSystem : public llvm::vfs::ProxyFileSystem {
+public:
+  static Expected<IntrusiveRefCntPtr<StatCacheFileSystem>>
+  create(std::unique_ptr<llvm::MemoryBuffer> &&CacheBuffer,
+         StringRef CacheFilename, IntrusiveRefCntPtr<FileSystem> FS);
+
+  llvm::ErrorOr<llvm::vfs::Status> status(const Twine &Path) override;
+
+private:
+  class StatCacheLookupInfo;
+  using StatCacheType =
+      llvm::OnDiskIterableChainedHashTable<StatCacheLookupInfo>;
+
+  explicit StatCacheFileSystem(std::unique_ptr<llvm::MemoryBuffer> &&CacheFile,
+                               IntrusiveRefCntPtr<FileSystem> FS,
+                               bool IsCaseSensitive);
+
+  std::unique_ptr<llvm::MemoryBuffer> StatCacheFile;
+  llvm::StringRef StatCachePrefix;
+  std::unique_ptr<StatCacheType> StatCache;
+  bool IsCaseSensitive = true;
 };
 
 } // namespace vfs
