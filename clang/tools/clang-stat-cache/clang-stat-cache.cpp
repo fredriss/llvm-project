@@ -34,6 +34,8 @@
 #ifdef __APPLE__
 #include <CoreServices/CoreServices.h>
 
+#include "GetAttrList.h"
+
 #include <sys/mount.h>
 #include <sys/param.h>
 #endif // __APPLE__
@@ -61,6 +63,92 @@ cl::opt<bool> Force("f", cl::desc("Force cache generation"));
 namespace {
 
 #if __APPLE__
+template <typename... Attrs>
+sys::fs::file_status
+statFromAttributes(const std::tuple<Attrs...> &Attributes) {
+  using namespace llvm::sys::fs;
+  static file_type objTypeToLLVM[] = {
+      file_type::type_unknown,   file_type::regular_file,
+      file_type::directory_file, file_type::block_file,
+      file_type::character_file, file_type::symlink_file,
+      file_type::socket_file,    file_type::fifo_file,
+      file_type::type_unknown,   file_type::type_unknown,
+      file_type::type_unknown};
+  perms Perms =
+      static_cast<perms>(*std::get<AttrCommonAccessMask>(Attributes)) &
+      all_perms;
+
+  auto objType = *std::get<AttrCommonObjType>(Attributes);
+  assert(objType < sizeof(objTypeToLLVM) &&
+         "Invalid objType returned by getattrlist");
+  file_status s(objTypeToLLVM[objType], Perms,
+                *std::get<AttrCommonDevId>(Attributes),
+                objType == VDIR ? *std::get<AttrDirLinkCount>(Attributes)
+                                : *std::get<AttrFileLinkCount>(Attributes),
+                *std::get<AttrCommonFileId>(Attributes),
+                (*std::get<AttrCommonAccTime>(Attributes)).tv_sec,
+                (*std::get<AttrCommonAccTime>(Attributes)).tv_nsec,
+                (*std::get<AttrCommonModTime>(Attributes)).tv_sec,
+                (*std::get<AttrCommonModTime>(Attributes)).tv_nsec,
+                *std::get<AttrCommonOwnerId>(Attributes),
+                *std::get<AttrCommonGrpId>(Attributes),
+                objType == VDIR ? *std::get<AttrDirDataLength>(Attributes)
+                                : *std::get<AttrFileDataLength>(Attributes));
+  return s;
+}
+
+void populateHashTable(StringRef BasePath,
+                       StatCacheFileSystem::StatCacheWriter &Generator) {
+  using namespace llvm::sys::fs;
+
+  std::list<std::string> DirStack = {BasePath.str()};
+
+  while (true) {
+    if (DirStack.empty())
+      break;
+
+    std::string CurrentDirName = std::move(DirStack.front());
+    DirStack.pop_front();
+
+    GetAttrListBulk<AttrCommonReturnedAttrs, AttrCommonName, AttrCommonDevId,
+                    AttrCommonObjType, AttrCommonModTime, AttrCommonAccTime,
+                    AttrCommonOwnerId, AttrCommonGrpId, AttrCommonAccessMask,
+                    AttrCommonFileId, AttrDirLinkCount, AttrDirDataLength,
+                    AttrFileLinkCount, AttrFileDataLength>
+        Entries(CurrentDirName);
+
+    auto Result = Entries.execute();
+
+    if (auto E = Result.takeError()) {
+      errs() << "getattrlistbulk failed on '" << CurrentDirName << "': " << E
+             << '\n';
+      continue;
+    }
+
+    for (const auto &attrs : *Result) {
+      sys::fs::file_status S;
+      std::string Filename = (CurrentDirName + sys::path::get_separator() +
+                              *std::get<AttrCommonName>(attrs))
+                                 .str();
+
+      auto objType = *std::get<AttrCommonObjType>(attrs);
+
+      // getattrlistbulk doesn't have a mode to follow links by default.
+      // When encountering a link, use the normal stat to resolve it.
+      if (objType == VLNK)
+        sys::fs::status(Filename, S);
+      else
+        S = statFromAttributes(attrs);
+
+      Generator.addEntry(Filename, S);
+
+      // If the link points to a directory, add it to our queue.
+      if (S.type() == file_type::directory_file)
+        DirStack.emplace_back(std::move(Filename));
+    }
+  }
+}
+
 struct CallbackInfo {
   FSEventStreamEventId LastEvent;
   bool SeenChanges = false;
@@ -116,10 +204,6 @@ bool checkForFilesystemUpdates(uint64_t &ValidityToken) {
 
 #else // __APPLE__
 
-bool checkForFilesystemUpdates(uint64_t &ValidityToken) { return true; }
-
-#endif // __APPLE__
-
 std::error_code
 populateHashTable(StringRef BasePath,
                   StatCacheFileSystem::StatCacheWriter &Generator) {
@@ -141,6 +225,10 @@ populateHashTable(StringRef BasePath,
 
   return ErrorCode;
 }
+
+bool checkForFilesystemUpdates(uint64_t &ValidityToken) { return true; }
+
+#endif // __APPLE__
 
 bool checkValidity(int FD, uint64_t &ValidityToken) {
   sys::fs::file_status Status;
