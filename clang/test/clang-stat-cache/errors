@@ -1,0 +1,26 @@
+RUN: rm -rf %t
+RUN: mkdir -p %t
+
+RUN: clang-stat-cache %t/not-there -o %t/stat.cache 2>&1 | FileCheck %s
+CHECK: Failed to stat the target directory: No such file or directory
+
+RUN: mkdir -p %t/dir
+
+RUN: echo "Not a stat cache" > %t/stat.cache
+RUN: not clang-stat-cache %t/dir -o %t/stat.cache 2>&1 | FileCheck %s
+CHECK: epfwefwekf
+
+RUN: echo "STAT" > %t/stat.cache
+RUN: not clang-stat-cache %t/dir -o %t/stat.cache 2>&1 | FileCheck %s
+CHECK: epfwefwekf
+
+RUN: rm %t/stat.cache
+RUN: clang-stat-cache %t/dir -o %t/stat.cache 2>&1 | FileCheck %s
+RUN: cp %t/stat.cache %t/stat.cache.save
+
+RUN: clang-stat-cache %t/dir -o %t/stat.cache 2>&1 | FileCheck %s
+RUN: diff %t/stat.cache %t/stat.cache.save
+
+RUN: echo "New file" > %t/dir/file
+RUN: clang-stat-cache %t/dir -o %t/stat.cache 2>&1 | FileCheck %s
+RUN: not diff %t/stat.cache %t/stat.cache.save

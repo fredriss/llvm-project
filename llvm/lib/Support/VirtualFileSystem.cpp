@@ -35,6 +35,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FileSystem/UniqueID.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/OnDiskHashTable.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SMLoc.h"
 #include "llvm/Support/SourceMgr.h"
@@ -2810,4 +2811,272 @@ recursive_directory_iterator::increment(std::error_code &EC) {
     State.reset(); // end iterator
 
   return *this;
+}
+
+class StatCacheFileSystem::StatCacheLookupInfo {
+public:
+  typedef StringRef external_key_type;
+  typedef StringRef internal_key_type;
+  typedef llvm::sys::fs::file_status data_type;
+  typedef uint32_t hash_value_type;
+  typedef uint32_t offset_type;
+
+  static bool EqualKey(const internal_key_type &a, const internal_key_type &b) {
+    return a == b;
+  }
+
+  static hash_value_type ComputeHash(const internal_key_type &a) {
+    return llvm::hash_value(a);
+  }
+
+  static std::pair<unsigned, unsigned>
+  ReadKeyDataLength(const unsigned char *&d) {
+    using namespace llvm::support;
+    unsigned KeyLen = endian::readNext<uint16_t, little, unaligned>(d);
+    unsigned DataLen = endian::readNext<uint16_t, little, unaligned>(d);
+    return std::make_pair(KeyLen, DataLen);
+  }
+
+  static const internal_key_type &GetInternalKey(const external_key_type &x) {
+    return x;
+  }
+
+  static const external_key_type &GetExternalKey(const internal_key_type &x) {
+    return x;
+  }
+
+  static internal_key_type ReadKey(const unsigned char *d, unsigned n) {
+    return StringRef((const char *)d, n);
+  }
+
+  static data_type ReadData(const internal_key_type &k, const unsigned char *d,
+                            unsigned DataLen) {
+    data_type Result;
+    memcpy(&Result, d, sizeof(Result));
+    return Result;
+  }
+};
+
+class StatCacheFileSystem::StatCacheGenerationInfo {
+public:
+  typedef StringRef key_type; // Must be copy constructible
+  typedef const StringRef &key_type_ref;
+  typedef sys::fs::file_status data_type; // Must be copy constructible
+  typedef sys::fs::file_status &data_type_ref;
+  typedef uint32_t hash_value_type; // The type the hash function returns.
+  typedef uint32_t offset_type;     // The type for offsets into the table.
+
+  /// Calculate the hash for Key
+  static hash_value_type ComputeHash(key_type_ref Key) {
+    return static_cast<size_t>(hash_value(Key));
+  }
+
+  /// Return the lengths, in bytes, of the given Key/Data pair.
+  static std::pair<unsigned, unsigned>
+  EmitKeyDataLength(raw_ostream &Out, key_type_ref Key, data_type_ref Data) {
+    using namespace llvm::support;
+    endian::Writer LE(Out, little);
+    unsigned KeyLen = Key.size();
+    unsigned DataLen = sizeof(Data);
+    LE.write<uint16_t>(KeyLen);
+    LE.write<uint16_t>(DataLen);
+    return std::make_pair(KeyLen, DataLen);
+  }
+
+  static void EmitKey(raw_ostream &Out, key_type_ref Key, unsigned KeyLen) {
+    Out.write(Key.data(), KeyLen);
+  }
+
+  /// Write Data to Out.  DataLen is the length from EmitKeyDataLength.
+  static void EmitData(raw_ostream &Out, key_type_ref Key, data_type_ref Data,
+                       unsigned Len) {
+    Out.write((const char *)&Data, Len);
+  }
+
+  static bool EqualKey(key_type_ref Key1, key_type_ref Key2) {
+    return Key1 == Key2;
+  }
+};
+
+StatCacheFileSystem::StatCacheFileSystem(
+    std::unique_ptr<llvm::MemoryBuffer> &&CacheFile,
+    IntrusiveRefCntPtr<FileSystem> FS, bool IsCaseSensitive)
+    : ProxyFileSystem(std::move(FS)), StatCacheFile(std::move(CacheFile)),
+      IsCaseSensitive(IsCaseSensitive) {
+  uint32_t BucketOffset;
+  // BucketOffset is right after the Magic number.
+  memcpy(&BucketOffset, StatCacheFile->getBufferStart() + 4,
+         sizeof(BucketOffset));
+  const char *CacheFileStart = StatCacheFile->getBufferStart();
+  StatCachePrefix = StringRef(CacheFileStart + 16);
+  const unsigned char *HashTableStart =
+      (const unsigned char *)CacheFileStart + 16 + StatCachePrefix.size() + 1;
+  StatCache.reset(StatCacheType::Create(
+      (const unsigned char *)CacheFileStart + BucketOffset, HashTableStart,
+      (const unsigned char *)CacheFileStart));
+}
+
+Expected<IntrusiveRefCntPtr<StatCacheFileSystem>>
+StatCacheFileSystem::create(std::unique_ptr<llvm::MemoryBuffer> &&CacheBuffer,
+                            StringRef CacheFilename,
+                            IntrusiveRefCntPtr<FileSystem> FS) {
+  struct StatCacheHeader {
+    char Magic[4];
+    uint32_t BucketOffset;
+    uint64_t ValidityToken;
+    char BaseDir[1];
+  };
+  if (CacheBuffer->getBufferSize() < sizeof(StatCacheHeader)) {
+    llvm::errs() << "The output cache file is not empty or a valid cache. "
+                 << "Giving up.\n";
+    return createFileError(CacheFilename,
+                           make_error_code(llvm::errc::invalid_argument));
+  }
+
+  auto *Header =
+      reinterpret_cast<const StatCacheHeader *>(CacheBuffer->getBufferStart());
+  if (memcmp(Header->Magic, "STAT", sizeof(Header->Magic)) &&
+      memcmp(Header->Magic, "Stat", sizeof(Header->Magic))) {
+    llvm::errs() << "Output file is not a stat cache. Giving up.\n";
+    return createFileError(CacheFilename,
+                           make_error_code(llvm::errc::invalid_argument));
+  }
+
+  auto PathLen = strnlen(Header->BaseDir, CacheBuffer->getBufferSize() - 16);
+
+  if (Header->BaseDir[PathLen] != 0) {
+    return createFileError(CacheFilename,
+                           make_error_code(llvm::errc::invalid_argument));
+  }
+
+  return new StatCacheFileSystem(std::move(CacheBuffer), FS,
+                                 Header->Magic[3] == 't');
+}
+
+llvm::ErrorOr<llvm::vfs::Status>
+StatCacheFileSystem::status(const Twine &Path) {
+  SmallString<180> StringPath;
+  Path.toVector(StringPath);
+
+  if (!IsCaseSensitive)
+    std::transform(StringPath.begin(), StringPath.end(), StringPath.begin(),
+                   toLower);
+
+  // Canonicalize the path. This removes single dot path components,
+  // but it also gets rid of repeating separators.
+  llvm::sys::path::remove_dots(StringPath);
+
+  StringRef SuffixPath(StringPath);
+  if (!SuffixPath.consume_front(StatCachePrefix))
+    return ProxyFileSystem::status(Path);
+
+  auto It = StatCache->find(SuffixPath);
+  if (It == StatCache->end()) {
+    // We didn't find the file in the cache even though it started with the
+    // cache prefix. It could be that the file doesn't exist, or the spelling
+    // the pathis different. The canonicalization that the call to remove_dots()
+    // does leaves only '..' with symlinks as a source of confusion. If the path
+    // does not contain '..' we can safely say it doesn't exist.
+    if (std::find(sys::path::begin(SuffixPath), sys::path::end(SuffixPath),
+                  "..") == sys::path::end(SuffixPath)) {
+      return llvm::errc::no_such_file_or_directory;
+    }
+    return ProxyFileSystem::status(Path);
+  }
+
+  // Broken symlink.
+  if ((*It).getUniqueID() == llvm::sys::fs::UniqueID())
+    return llvm::errc::no_such_file_or_directory;
+
+  return llvm::vfs::Status::copyWithNewName(*It, Path);
+}
+
+StatCacheFileSystem::StatCacheWriter::StatCacheWriter(StringRef BaseDir,
+                                                      bool IsCaseSensitive,
+                                                      uint64_t ValidityToken)
+    : BaseDir(IsCaseSensitive ? BaseDir.str() : BaseDir.lower()),
+      IsCaseSensitive(IsCaseSensitive), ValidityToken(ValidityToken),
+      Generator(
+          new OnDiskChainedHashTableGenerator<StatCacheGenerationInfo>()) {}
+
+StatCacheFileSystem::StatCacheWriter::~StatCacheWriter() { delete Generator; }
+
+void StatCacheFileSystem::StatCacheWriter::addEntry(
+    StringRef Path, sys::fs::file_status &Status) {
+  std::string StoredPath;
+  if (!IsCaseSensitive) {
+    StoredPath = Path.lower();
+    Path = StoredPath;
+  }
+
+  __attribute__((unused)) bool Consumed = Path.consume_front(BaseDir);
+  assert(Consumed && "Path does not start with expected prefix.");
+
+  PathStorage.emplace_back(Path.str());
+  Generator->insert(PathStorage.back(), Status);
+}
+
+// The format of the stat cache is (pseudo-code):
+//  struct stat_cache {
+//    char     Magic[4];       // "STAT" or "Stat"
+//    uint32_t BucketOffset;   // See BucketOffset in OnDiskHashTable.h
+//    uint64_t ValidityToken;  // Platofrm specific data allowing to check
+//                             // whether the cache is up-to-date.
+//    char     BaseDir[N];     // Zero terminated path to the base directory
+//    < OnDiskHashtable Data > // Data for the has table. The keys are the
+//                             // relative paths under BaseDir. The data is
+//                             // llvm::sys::fs::file_status structures.
+//  };
+
+#define MAGIC_CASE_SENSITIVE "Stat"
+#define MAGIC_CASE_INSENSITIVE "STAT"
+
+size_t
+StatCacheFileSystem::StatCacheWriter::writeStatCache(raw_fd_ostream &Out) {
+  // Magic value.
+  if (IsCaseSensitive)
+    Out.write(MAGIC_CASE_SENSITIVE, 4);
+  else
+    Out.write(MAGIC_CASE_INSENSITIVE, 4);
+  // Placeholder for BucketOffset, filled in below.
+  Out.write("\0\0\0\0", 4);
+  // Write out the validity token.
+  Out.write((const char *)&ValidityToken, sizeof(ValidityToken));
+  // Write out the base directory for the cache.
+  Out.write(BaseDir.c_str(), BaseDir.size() + 1);
+  // Write out the hashtable data.
+  uint32_t BucketOffset = Generator->Emit(Out);
+  int Size = Out.tell();
+  // Move back to right after the Magic to insert BucketOffset
+  Out.seek(4);
+  Out.write((const char *)&BucketOffset, sizeof(BucketOffset));
+  return Size;
+}
+
+Error StatCacheFileSystem::validateCacheFile(llvm::MemoryBufferRef Buffer,
+                                             StringRef &BaseDir,
+                                             uint64_t &ValidityToken) {
+  struct StatCacheHeader {
+    char Magic[4];
+    uint32_t BucketOffset;
+    uint64_t ValidityToken;
+    char BaseDir[1];
+  };
+
+  auto *Header =
+      reinterpret_cast<const StatCacheHeader *>(Buffer.getBufferStart());
+  if (Buffer.getBufferSize() < sizeof(StatCacheHeader) ||
+      (memcmp(Header->Magic, MAGIC_CASE_INSENSITIVE, sizeof(Header->Magic)) &&
+       memcmp(Header->Magic, MAGIC_CASE_SENSITIVE, sizeof(Header->Magic))) ||
+      Header->BucketOffset > Buffer.getBufferSize())
+    return createStringError(inconvertibleErrorCode(), "Invalid cache file");
+
+  auto PathLen = strnlen(Header->BaseDir, Buffer.getBufferSize() - 16);
+  if (Header->BaseDir[PathLen] != 0)
+    return createStringError(inconvertibleErrorCode(), "Invalid cache file");
+
+  BaseDir = StringRef(Header->BaseDir, PathLen);
+  ValidityToken = Header->ValidityToken;
+
+  return ErrorSuccess();
 }

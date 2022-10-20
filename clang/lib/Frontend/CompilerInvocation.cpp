@@ -3276,6 +3276,9 @@ static void GenerateHeaderSearchArgs(HeaderSearchOptions &Opts,
     GenerateArg(Args, Opt, P.Prefix, SA);
   }
 
+  for (const std::string &F : Opts.VFSStatCacheFiles)
+    GenerateArg(Args, OPT_ivfsstatcache, F, SA);
+
   for (const std::string &F : Opts.VFSOverlayFiles)
     GenerateArg(Args, OPT_ivfsoverlay, F, SA);
 }
@@ -3408,6 +3411,9 @@ static bool ParseHeaderSearchArgs(HeaderSearchOptions &Opts, ArgList &Args,
        Args.filtered(OPT_system_header_prefix, OPT_no_system_header_prefix))
     Opts.AddSystemHeaderPrefix(
         A->getValue(), A->getOption().matches(OPT_system_header_prefix));
+
+  for (const auto *A : Args.filtered(OPT_ivfsstatcache))
+    Opts.AddVFSStatCacheFile(A->getValue());
 
   for (const auto *A : Args.filtered(OPT_ivfsoverlay))
     Opts.AddVFSOverlayFile(A->getValue());
@@ -5106,6 +5112,23 @@ IntrusiveRefCntPtr<llvm::vfs::FileSystem>
 clang::createVFSFromCompilerInvocation(
     const CompilerInvocation &CI, DiagnosticsEngine &Diags,
     IntrusiveRefCntPtr<llvm::vfs::FileSystem> BaseFS) {
+  for (const auto &File : CI.getHeaderSearchOpts().VFSStatCacheFiles) {
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> Buffer =
+        llvm::MemoryBuffer::getFile(File);
+    if (!Buffer) {
+      Diags.Report(diag::err_missing_vfs_stat_cache_file) << File;
+      continue;
+    }
+
+    auto StatCache = llvm::vfs::StatCacheFileSystem::create(std::move(*Buffer),
+                                                            File, BaseFS);
+
+    if (errorToBool(StatCache.takeError()))
+      Diags.Report(diag::err_invalid_vfs_stat_cache) << File;
+    else
+      BaseFS = std::move(*StatCache);
+  }
+
   if (CI.getHeaderSearchOpts().VFSOverlayFiles.empty())
     return BaseFS;
 
